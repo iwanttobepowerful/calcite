@@ -945,4 +945,8 @@ public class CoreRules {
    *  into equivalent {@link Union} ALL of GROUP BY operations. */
   public static final AggregateGroupingSetsToUnionRule AGGREGATE_GROUPING_SETS_TO_UNION =
       AggregateGroupingSetsToUnionRule.Config.DEFAULT.toRule();
+
+  /** Rule that gets rid of the LITERAL_AGG into most databases can handle */
+  public static final LiteralAggExtractRule LITERAL_AGG_EXTRACT =
+      LiteralAggExtractRule.Config.DEFAULT.toRule();
 }
