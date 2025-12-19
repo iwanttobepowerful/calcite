@@ -73,6 +73,7 @@ import org.apache.calcite.rex.RexShuttle;
 import org.apache.calcite.rex.RexSubQuery;
 import org.apache.calcite.rex.RexUtil;
 import org.apache.calcite.rex.RexVisitorImpl;
+import org.apache.calcite.rex.RexWindowBounds;
 import org.apache.calcite.runtime.PairList;
 import org.apache.calcite.sql.SqlAggFunction;
 import org.apache.calcite.sql.SqlExplainFormat;
@@ -574,16 +575,7 @@ public class RelDecorrelator implements ReflectiveVisitor {
     }
 
     if (isCorVarDefined && (rel.fetch != null || rel.offset != null)) {
-      if (rel.fetch != null
-          && rel.offset == null
-          && RexLiteral.intValue(rel.fetch) == 1) {
-        return decorrelateFetchOneSort(rel, frame);
-      }
-      // Can not decorrelate if the sort has per-correlate-key attributes like
-      // offset or fetch limit, because these attributes scope would change to
-      // global after decorrelation. They should take effect within the scope
-      // of the correlation key actually.
-      return null;
+      return decorrelateFetchOneSort(rel, frame);
     }
 
     final RelNode newInput = frame.r;
@@ -1045,29 +1037,30 @@ public class RelDecorrelator implements ReflectiveVisitor {
   }
 
   protected @Nullable Frame decorrelateFetchOneSort(Sort sort, final Frame frame) {
+    if (sort.offset == null
+        && sort.fetch != null
+        && RexLiteral.intValue(sort.fetch) == 0) {
+      return null;
+    }
+
+    // Rewrite logic:
+    //
+    // For correlated Sort with LIMIT/OFFSET:
+    //   1) Special case: if OFFSET is null and FETCH = 1, we may rewrite as an Aggregate
+    //      using MIN/MAX (see decorrelateSortAsAggregate).
+    //   2) General case: rewrite as
+    //        Project(original_fields..., corVars..., rn)
+    //          where rn = ROW_NUMBER() OVER (PARTITION BY corVars ORDER BY sortExprs
+    //                                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+    //        Filter(rn > offset, rn <= offset + fetch)
+    //      This preserves per-corVar LIMIT/OFFSET semantics.
+    //
+
     Frame aggFrame = decorrelateSortAsAggregate(sort, frame);
     if (aggFrame != null) {
       return aggFrame;
     }
-    //
-    // Rewrite logic:
-    //
-    // If sorted without offset and fetch = 1 (enforced by the caller), rewrite the sort to be
-    //   Aggregate(group=(corVar.. , field..))
-    //     project(first_value(field) over (partition by corVar order by (sort collation)))
-    //       input
-    //
-    // 1. For the original sorted input, apply the FIRST_VALUE window function to produce
-    //    the result of sorting with LIMIT 1, and the same as the decorrelate of aggregate,
-    //    add correlated variables in partition list to maintain semantic consistency.
-    // 2. To ensure that there is at most one row of output for
-    //    any combination of correlated variables, distinct for correlated variables.
-    // 3. Since we have partitioned by all correlated variables
-    //    in the sorted output field window, so for any combination of correlated variables,
-    //    all other field values are unique. So the following two are equivalent:
-    //      - group by corVar1, covVar2, field1, field2
-    //      - any_value(fields1), any_value(fields2) group by corVar1, covVar2
-    //    Here we use the first.
+
     final Map<Integer, Integer> mapOldToNewOutputs = new HashMap<>();
     final NavigableMap<CorDef, Integer> corDefOutputs = new TreeMap<>();
 
@@ -1099,29 +1092,60 @@ public class RelDecorrelator implements ReflectiveVisitor {
     for (RelDataTypeField field : sort.getRowType().getFieldList()) {
       final int newIdx =
           requireNonNull(frame.oldToNewOutputs.get(field.getIndex()));
-
-      RelBuilder.AggCall aggCall =
-          relBuilder.aggregateCall(SqlStdOperatorTable.FIRST_VALUE,
-              RexInputRef.of(newIdx, fieldList));
-
-      // Convert each field from the sorted output to a window function that partitions by
-      // correlated variables, orders by the collation, and return the first_value.
-      RexNode winCall = aggCall.over()
-          .orderBy(sortExprs)
-          .partitionBy(corVarProjects.leftList())
-          .toRex();
       mapOldToNewOutputs.put(newProjExprs.size(), newProjExprs.size());
-      newProjExprs.add(winCall, field.getName());
+      newProjExprs.add(RexInputRef.of(newIdx, fieldList), field.getName());
     }
     newProjExprs.addAll(corVarProjects);
-    RelNode result = relBuilder.push(frame.r)
-        .project(newProjExprs.leftList(), newProjExprs.rightList())
-        .distinct().build();
 
+    relBuilder.push(frame.r);
+
+    RexNode rowNumberCall = relBuilder.aggregateCall(SqlStdOperatorTable.ROW_NUMBER)
+        .over()
+        .partitionBy(corVarProjects.leftList())
+        .orderBy(sortExprs)
+        .let(c -> c.rowsBetween(RexWindowBounds.UNBOUNDED_PRECEDING, RexWindowBounds.CURRENT_ROW))
+        .toRex();
+    newProjExprs.add(rowNumberCall, "rn"); // Add the row number column
+    relBuilder.project(newProjExprs.leftList(), newProjExprs.rightList());
+
+    List<RexNode> conditions = new ArrayList<>();
+    if (sort.offset != null) {
+      RexNode greaterThenLowerBound =
+          relBuilder.call(
+              SqlStdOperatorTable.GREATER_THAN,
+              relBuilder.field(newProjExprs.size() - 1),
+              sort.offset);
+      conditions.add(greaterThenLowerBound);
+    }
+    if (sort.fetch != null) {
+      RexNode upperBound = sort.offset == null
+          ? sort.fetch
+          : relBuilder.call(SqlStdOperatorTable.PLUS, sort.offset, sort.fetch);
+      RexNode lessThenOrEqualUpperBound =
+          relBuilder.call(
+              SqlStdOperatorTable.LESS_THAN_OR_EQUAL,
+              relBuilder.field(newProjExprs.size() - 1),
+              upperBound);
+      conditions.add(lessThenOrEqualUpperBound);
+    }
+
+    RelNode result;
+    if (!conditions.isEmpty()) {
+      result = relBuilder.filter(conditions).build();
+    } else {
+      result = relBuilder.build();
+    }
     return register(sort, result, mapOldToNewOutputs, corDefOutputs);
   }
 
   protected @Nullable Frame decorrelateSortAsAggregate(Sort sort, final Frame frame) {
+    if (sort.offset != null) {
+      return null;
+    }
+    if (sort.fetch == null || RexLiteral.intValue(sort.fetch) != 1) {
+      return null;
+    }
+
     final Map<Integer, Integer> mapOldToNewOutputs = new HashMap<>();
     final NavigableMap<CorDef, Integer> corDefOutputs = new TreeMap<>();
     if (sort.getCollation().getFieldCollations().size() == 1
@@ -3314,7 +3338,7 @@ public class RelDecorrelator implements ReflectiveVisitor {
           && mapRefRelToCorRef.equals(((CorelMap) obj).mapRefRelToCorRef)
           && mapCorToCorRel.equals(((CorelMap) obj).mapCorToCorRel)
           && mapFieldAccessToCorRef.equals(
-              ((CorelMap) obj).mapFieldAccessToCorRef);
+          ((CorelMap) obj).mapFieldAccessToCorRef);
     }
 
     @Override public int hashCode() {
